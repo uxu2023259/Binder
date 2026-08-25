@@ -1,0 +1,41 @@
+# 灵魂绑定消息配置
+# 所有文本均为中文，颜色符号使用 &，文件编码请保持 UTF-8。
+
+prefix: "&d✦ &6灵魂绑定 &8» &r"
+
+gui:
+  main-title: "&5灵魂绑定"
+  player-stats-title: "&5绑定体检"
+  help-title: "&5使用帮助"
+  list-title: "&5我的绑定物"
+  confirm-title: "&4确认操作"
+  detail-title: "&5绑定详情"
+  admin-title: "&4管理面板"
+  admin-stats-title: "&4数据统计"
+  admin-players-title: "&4选择玩家"
+  admin-records-title: "&4玩家绑定物"
+  owner-select-title: "&4选择新绑定者"
+  quarantine-title: "&4隔离仓库"
+  empty-name: "&c暂无绑定物"
+  help-name: "&6使用说明"
+  previous-page: "&e上一页"
+  next-page: "&e下一页"
+  confirm-name: "&a确认"
+  cancel-name: "&c取消"
+
+lore:
+  binding-title: "&6灵魂绑定"
+  owner: "&7绑定者：&f%owner%"
+  id: "&8绑定编号：%id%"
+  locked: "&7不可离包：&f%locked%"
+
+help:
+  list:
+    - "&7输入 &f/bind &7打开菜单。"
+    - "&7列表左键召回，右键查看详情。"
+    - "&7找不到物品时，先刷新位置。"
+    - "&7召回会先移除原物品，避免复制。"
+
+release:
+  # 显示在管理员重载成功提示中，方便服主确认当前插件品牌。
+  brand: "Binder"

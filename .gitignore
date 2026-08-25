@@ -1,0 +1,15 @@
+# Maven build output
+/target/
+
+# Packaged plugin artifacts
+/PLUGIN/*.jar
+
+# IDE metadata
+/.idea/
+/.vscode/
+*.iml
+
+# OS metadata
+.DS_Store
+Thumbs.db
+

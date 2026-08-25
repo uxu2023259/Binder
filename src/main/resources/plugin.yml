@@ -1,0 +1,23 @@
+name: Binder
+version: 1.0.86
+main: awa.uxu.BinderPlugin
+api-version: '1.20'
+author: hyx
+description: 绑定、追踪并安全召回玩家重要物品
+softdepend: [Vault, CoreProtect]
+commands:
+  bind:
+    description: 打开灵魂绑定菜单
+    usage: /bind
+    aliases: [soulbind, sbind]
+    permission: bind.use
+    permission-message: "§c你没有打开灵魂绑定菜单的权限。"
+permissions:
+  bind.use:
+    description: 允许打开灵魂绑定菜单并使用玩家功能
+    default: true
+  bind.admin:
+    description: 允许管理所有玩家的绑定物
+    default: op
+    children:
+      bind.use: true
