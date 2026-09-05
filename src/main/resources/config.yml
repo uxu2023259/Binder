@@ -109,7 +109,7 @@ coreprotect:
   enabled: true
   # 是否输出 CoreProtect 相关调试日志。默认关闭，CoreProtect 接入、查询、跳过和异常都不会刷屏。
   debug-logging: false
-  # GUI 刷新位置时是否使用 CoreProtect 候选查询。关闭后 GUI 只显示插件自身当前能扫描到的位置。
+  # GUI 刷新位置时是否使用 CoreProtect 候选查询。查询始终在异步单消费者队列中执行，不阻塞服务器 tick。
   use-in-display-scan: true
   # 手动深度全服扫描中是否使用 CoreProtect 候选查询。自动轻量扫描不会查询 CoreProtect，避免长期占用主线程。
   use-in-auto-scan: true
@@ -125,6 +125,12 @@ coreprotect:
   lookup-limit: 200
   # 单次扫描操作最多对多少条绑定记录发起 CoreProtect 查询；超出部分下次继续，避免 CoreProtect 查询造成主线程尖峰。
   max-record-queries-per-operation: 8
+  # CoreProtect 查询结果缓存时间。缓存可合并短时间内重复点击，并让候选验证与数据库查询彻底解耦。
+  lookup-cache-seconds: 120
+  # 异步查询队列最大长度。队列只有一个消费者，避免大量 SQLite 查询同时争用 CoreProtect 数据库。
+  max-queued-lookups: 64
+  # 每次玩家操作最多验证多少个候选容器。未加载区块通过 Paper 异步加载，后续在主线程验证真实 UUID。
+  max-candidate-verifications-per-operation: 4
   # 是否同时读取容器移除记录作为候选位置。开启后更容易追踪漏斗链路或多次转移；不会仅凭移除记录生成物品。
   include-container-removals: true
   # 插件从容器移除绑定物时，是否向 CoreProtect 写入容器交易记录。

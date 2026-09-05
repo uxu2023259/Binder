@@ -57,6 +57,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 import java.util.logging.Level;
 
@@ -90,6 +91,7 @@ public final class BindingService {
     private final Map<String, Long> alertCooldowns = new HashMap<>();
     private final Map<UUID, Boolean> alertPreferences = new HashMap<>();
     private final Map<String, Set<Material>> materialCache = new HashMap<>();
+    private final Set<String> pendingCoreProtectCandidateVerifications = ConcurrentHashMap.newKeySet();
     private long lastEventBackupAt;
     private boolean eventBackupQueued;
     private String queuedEventBackupReason;
@@ -646,7 +648,7 @@ public final class BindingService {
             return 0;
         }
 
-        Map<UUID, List<FoundItem>> foundById = findAllOccurrencesBatch(changed, true, true);
+        Map<UUID, List<FoundItem>> foundById = findInteractiveOccurrencesBatch(changed, true);
         Set<UUID> dirtyRecords = new HashSet<>();
         for (BindingRecord record : changed) {
             dirtyRecords.add(record.getId());
@@ -699,47 +701,24 @@ public final class BindingService {
 
     public List<FoundItem> findAllOccurrences(BindingRecord record, boolean loadTrackedContainer, boolean useCoreProtect) {
         List<FoundItem> found = new ArrayList<>();
-        Set<String> scannedContainers = new HashSet<>();
         UUID id = record.getId();
-        for (Player player : Bukkit.getOnlinePlayers()) {
-            scanPlayer(player, id, found);
-            scanTemporaryPlayerView(player, id, found);
-        }
-        if (loadTrackedContainer && record.getLocation().getType() == BindingLocation.Type.DROPPED) {
-            loadTrackedChunk(record.getLocation());
-        }
-        if (loadTrackedContainer && record.getLocation().getType() == BindingLocation.Type.CONTAINER) {
-            loadTrackedChunk(record.getLocation());
-            Inventory inventory = getInventoryAt(record.getLocation());
-            Location location = record.getLocation().toBlockLocation();
-            Entity entity = getEntityContainer(record.getLocation().getEntityUuid());
-            if (inventory != null && location != null) {
-                scanContainerInventory(inventory, id, found, location, entity, scannedContainers);
+        found.addAll(findKnownLocationOccurrences(record));
+        if (found.isEmpty()) {
+            for (Player player : Bukkit.getOnlinePlayers()) {
+                scanPlayer(player, id, found);
+                scanTemporaryPlayerView(player, id, found);
             }
         }
-        for (World world : Bukkit.getWorlds()) {
-            for (Item item : world.getEntitiesByClass(Item.class)) {
-                FoundItem dropped = FoundItem.dropped(item);
-                getBindingId(item.getItemStack()).ifPresent(itemId -> {
-                    if (itemId.equals(id)) {
-                        found.add(dropped);
-                    }
-                });
-                scanNestedItem(dropped, id, found, 0);
-            }
-        }
-        scanLoadedBlockContainers(id, found, scannedContainers);
-        scanLoadedEntityContainers(id, found, scannedContainers);
-        scanLoadedArmorStands(id, found);
-        scanLoadedItemFrames(id, found);
-        scanLoadedItemDisplays(id, found);
         if (found.isEmpty() && useCoreProtect && coreProtectHook != null && coreProtectHook.isAvailable()) {
-            int maxCoreProtectQueries = Math.max(0, plugin.getConfig().getInt("coreprotect.max-record-queries-per-operation", 8));
-            if (maxCoreProtectQueries <= 0) {
-                return found;
-            }
+            Set<String> scannedContainers = new HashSet<>();
+            int verificationLimit = Math.max(1, plugin.getConfig().getInt("coreprotect.max-candidate-verifications-per-operation", 4));
+            int verified = 0;
             for (Location candidate : coreProtectHook.lookupContainerCandidates(record)) {
-                Inventory inventory = getInventoryAt(candidate);
+                if (verified >= verificationLimit) {
+                    break;
+                }
+                verified++;
+                Inventory inventory = getLoadedInventoryAt(candidate);
                 if (inventory != null) {
                     int before = found.size();
                     scanContainerInventory(inventory, id, found, candidate, null, scannedContainers);
@@ -748,10 +727,101 @@ public final class BindingService {
                                 + "，位置 " + formatLocation(candidate)
                                 + "，并已在真实库存中确认绑定 UUID。");
                     }
+                    coreProtectHook.markCandidateVerified(record, candidate);
+                } else {
+                    scheduleCoreProtectCandidateVerification(record, candidate);
                 }
             }
         }
         return found;
+    }
+
+    private Map<UUID, List<FoundItem>> findInteractiveOccurrencesBatch(List<BindingRecord> records, boolean useCoreProtect) {
+        Map<UUID, List<FoundItem>> found = new HashMap<>();
+        Set<UUID> unresolved = new HashSet<>();
+        for (BindingRecord record : records) {
+            BindingLocation.Type locationType = record.getLocation().getType();
+            List<FoundItem> recordFound = locationType == BindingLocation.Type.PLAYER
+                    || locationType == BindingLocation.Type.TEMPORARY
+                    ? new ArrayList<>()
+                    : findKnownLocationOccurrences(record);
+            found.put(record.getId(), recordFound);
+            if (recordFound.isEmpty()) {
+                unresolved.add(record.getId());
+            }
+        }
+        if (!unresolved.isEmpty()) {
+            for (Player player : Bukkit.getOnlinePlayers()) {
+                scanPlayerBatch(player, unresolved, found);
+                scanTemporaryPlayerViewBatch(player, unresolved, found);
+            }
+        }
+        if (useCoreProtect && coreProtectHook != null && coreProtectHook.isAvailable()) {
+            int remainingQueries = Math.max(0, plugin.getConfig().getInt("coreprotect.max-record-queries-per-operation", 8));
+            for (BindingRecord record : records) {
+                List<FoundItem> recordFound = found.get(record.getId());
+                if (recordFound != null && !recordFound.isEmpty()) {
+                    continue;
+                }
+                if (remainingQueries-- <= 0) {
+                    break;
+                }
+                int verificationLimit = Math.max(1, plugin.getConfig().getInt("coreprotect.max-candidate-verifications-per-operation", 4));
+                int verified = 0;
+                Set<String> scannedContainers = new HashSet<>();
+                for (Location candidate : coreProtectHook.lookupContainerCandidates(record)) {
+                    if (verified++ >= verificationLimit) {
+                        break;
+                    }
+                    Inventory inventory = getLoadedInventoryAt(candidate);
+                    if (inventory == null) {
+                        scheduleCoreProtectCandidateVerification(record, candidate);
+                        continue;
+                    }
+                    scanContainerInventory(inventory, record.getId(), recordFound, candidate, null, scannedContainers);
+                    coreProtectHook.markCandidateVerified(record, candidate);
+                }
+            }
+        }
+        return found;
+    }
+
+    private void scheduleCoreProtectCandidateVerification(BindingRecord record, Location candidate) {
+        if (candidate == null || candidate.getWorld() == null || coreProtectHook == null) {
+            return;
+        }
+        String key = record.getId() + ":" + candidate.getWorld().getName() + ":"
+                + candidate.getBlockX() + ":" + candidate.getBlockY() + ":" + candidate.getBlockZ();
+        if (!pendingCoreProtectCandidateVerifications.add(key)) {
+            return;
+        }
+        UUID recordId = record.getId();
+        candidate.getWorld().getChunkAtAsync(candidate.getBlockX() >> 4, candidate.getBlockZ() >> 4, false)
+                .whenComplete((chunk, throwable) -> {
+                    if (!plugin.isEnabled()) {
+                        pendingCoreProtectCandidateVerifications.remove(key);
+                        return;
+                    }
+                    Bukkit.getScheduler().runTask(plugin, () -> {
+                        try {
+                            Optional<BindingRecord> current = store.find(recordId);
+                            if (throwable != null || chunk == null || current.isEmpty()) {
+                                return;
+                            }
+                            List<FoundItem> candidateFound = new ArrayList<>();
+                            Inventory inventory = getLoadedInventoryAt(candidate);
+                            if (inventory != null) {
+                                scanContainerInventory(inventory, recordId, candidateFound, candidate, null, new HashSet<>());
+                            }
+                            if (!candidateFound.isEmpty()) {
+                                deduplicate(current.get(), candidateFound);
+                            }
+                            coreProtectHook.markCandidateVerified(current.get(), candidate);
+                        } finally {
+                            pendingCoreProtectCandidateVerifications.remove(key);
+                        }
+                    });
+                });
     }
 
     private Map<UUID, List<FoundItem>> findAllOccurrencesBatch(List<BindingRecord> records, boolean loadTrackedContainer, boolean useCoreProtect) {
@@ -800,7 +870,7 @@ public final class BindingService {
                 }
                 remainingQueries--;
                 for (Location candidate : coreProtectHook.lookupContainerCandidates(record)) {
-                    Inventory inventory = getInventoryAt(candidate);
+                    Inventory inventory = getLoadedInventoryAt(candidate);
                     if (inventory != null) {
                         int before = recordFound == null ? 0 : recordFound.size();
                         scanContainerInventoryBatch(inventory, ids, found, candidate, null, scannedContainers);
@@ -2096,7 +2166,7 @@ public final class BindingService {
         if (records == null || records.isEmpty()) {
             return;
         }
-        Map<UUID, List<FoundItem>> foundById = findAllOccurrencesBatch(records, true, useCoreProtectInDisplayScan());
+        Map<UUID, List<FoundItem>> foundById = findInteractiveOccurrencesBatch(records, useCoreProtectInDisplayScan());
         boolean dirty = false;
         for (BindingRecord record : records) {
             ItemStack beforeItem = cloneOrNull(record.getItem());
@@ -3256,6 +3326,15 @@ public final class BindingService {
     }
 
     private boolean canCreateLostReplacement(BindingRecord record) {
+        if (coreProtectHook != null && coreProtectHook.isAvailable()) {
+            if (!coreProtectHook.hasFreshLookup(record)
+                    || coreProtectHook.isLookupPending(record)
+                    || coreProtectHook.hasCachedCandidates(record)) {
+                plugin.getLogger().warning("已暂缓丢失补发：绑定编号 " + shortId(record.getId())
+                        + " 的 CoreProtect 候选仍在异步查询或验证中。");
+                return false;
+            }
+        }
         BindingLocation location = record.getLocation();
         if (location.getType() == BindingLocation.Type.LOST) {
             return true;
