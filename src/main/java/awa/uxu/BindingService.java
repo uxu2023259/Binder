@@ -32,6 +32,7 @@ import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.PlayerInventory;
 import org.bukkit.inventory.meta.BlockStateMeta;
 import org.bukkit.inventory.meta.BundleMeta;
+import org.bukkit.inventory.meta.Damageable;
 import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.persistence.PersistentDataContainer;
 import org.bukkit.persistence.PersistentDataType;
@@ -159,7 +160,7 @@ public final class BindingService {
             playSound(player, "error");
             return false;
         }
-        if (!canBindMaterial(player, hand.getType())) {
+        if (!canBindItem(player, hand)) {
             return false;
         }
         if (getBindingId(hand).isPresent()) {
@@ -213,7 +214,7 @@ public final class BindingService {
                 return;
             }
             if (!canCreateLostReplacement(record)) {
-                player.sendMessage(prefix() + ChatColor.RED + "暂不能丢失召回：无法确认原物品已消失。请先刷新位置或检查容器。 ");
+                player.sendMessage(prefix() + ChatColor.RED + lostReplacementDeniedMessage(record));
                 playSound(player, "error");
                 return;
             }
@@ -265,7 +266,7 @@ public final class BindingService {
                     return;
                 }
                 if (!canCreateLostReplacement(record)) {
-                    player.sendMessage(prefix() + ChatColor.RED + "暂不能丢失召回：无法确认原物品已消失。请先刷新位置或检查容器。 ");
+                    player.sendMessage(prefix() + ChatColor.RED + lostReplacementDeniedMessage(record));
                     playSound(player, "error");
                     return;
                 }
@@ -289,7 +290,7 @@ public final class BindingService {
             return;
         }
         if (!canCreateLostReplacement(record)) {
-            player.sendMessage(prefix() + ChatColor.RED + "暂不能丢失召回：无法确认原物品已消失。请先刷新位置或检查容器。 ");
+            player.sendMessage(prefix() + ChatColor.RED + lostReplacementDeniedMessage(record));
             playSound(player, "error");
             return;
         }
@@ -329,7 +330,7 @@ public final class BindingService {
                 return;
             }
             if (!canCreateLostReplacement(record)) {
-                sender.sendMessage(prefix() + ChatColor.RED + "暂不能丢失召回：无法确认原物品已消失。请先刷新位置或检查容器。 ");
+                sender.sendMessage(prefix() + ChatColor.RED + lostReplacementDeniedMessage(record));
                 playSenderSound(sender, "error");
                 return;
             }
@@ -2582,8 +2583,20 @@ public final class BindingService {
         if (isEmpty(item) || !item.hasItemMeta()) {
             return false;
         }
-        Material material = item.getType();
-        return material == Material.BUNDLE || material.name().endsWith("SHULKER_BOX");
+        return isPortableStorageMaterial(item.getType());
+    }
+
+    public int remainingDurability(ItemStack item) {
+        if (isEmpty(item) || !(item.getItemMeta() instanceof Damageable damageable)) {
+            return -1;
+        }
+        int maxDurability = item.getType().getMaxDurability();
+        return maxDurability > 0 ? Math.max(0, maxDurability - damageable.getDamage()) : -1;
+    }
+
+    public boolean isExhaustedDurable(ItemStack item) {
+        int remaining = remainingDurability(item);
+        return remaining >= 0 && remaining <= 1;
     }
 
     public boolean isEmpty(ItemStack item) {
@@ -2772,7 +2785,13 @@ public final class BindingService {
         return (isEmpty(item) ? "未知物品" : item.getType().name()) + "（" + shortId(record.getId()) + "）";
     }
 
-    private boolean canBindMaterial(Player player, Material material) {
+    private boolean canBindItem(Player player, ItemStack item) {
+        Material material = item.getType();
+        if (isPortableItemContainer(item)) {
+            player.sendMessage(prefix() + ChatColor.RED + "可收纳物品的物品不能绑定，避免内容变化导致复制漏洞。 ");
+            playSound(player, "error");
+            return false;
+        }
         if (configuredMaterials("binding.blacklist").contains(material)) {
             player.sendMessage(prefix() + ChatColor.RED + "该物品类型已被配置为不可绑定：" + material.name() + "。 ");
             playSound(player, "error");
@@ -2784,6 +2803,24 @@ public final class BindingService {
             return false;
         }
         return true;
+    }
+
+    private boolean isPortableItemContainer(ItemStack item) {
+        if (isEmpty(item)) {
+            return false;
+        }
+        if (isPortableStorageMaterial(item.getType())) {
+            return true;
+        }
+        ItemMeta meta = item.getItemMeta();
+        return meta instanceof BundleMeta
+                || meta instanceof BlockStateMeta blockStateMeta
+                && blockStateMeta.getBlockState() instanceof InventoryHolder;
+    }
+
+    private boolean isPortableStorageMaterial(Material material) {
+        String name = material.name();
+        return name.equals("BUNDLE") || name.endsWith("_BUNDLE") || name.endsWith("SHULKER_BOX");
     }
 
     private Set<Material> configuredMaterials(String path) {
@@ -2818,7 +2855,7 @@ public final class BindingService {
         float volume = (float) plugin.getConfig().getDouble(path + ".volume", defaultSoundVolume(key));
         float pitch = (float) plugin.getConfig().getDouble(path + ".pitch", defaultSoundPitch(key));
         try {
-            Sound sound = org.bukkit.Registry.SOUNDS.get(org.bukkit.NamespacedKey.minecraft(soundName.toLowerCase(Locale.ROOT)));
+            Sound sound = resolveConfiguredSound(soundName);
             if (sound == null) {
                 throw new IllegalArgumentException("未知音效");
             }
@@ -2826,6 +2863,22 @@ public final class BindingService {
         } catch (IllegalArgumentException ex) {
             plugin.getLogger().warning("音效配置无效：sounds." + key + ".sound = " + soundName + "。 ");
         }
+    }
+
+    private Sound resolveConfiguredSound(String configuredName) {
+        String normalized = configuredName.trim();
+        try {
+            return Sound.valueOf(normalized.toUpperCase(Locale.ROOT));
+        } catch (IllegalArgumentException ignored) {
+            // Fall through to registry lookup for namespaced IDs such as minecraft:entity.villager.no.
+        }
+
+        String keyText = normalized.toLowerCase(Locale.ROOT);
+        if (!keyText.contains(":")) {
+            keyText = keyText.replace('_', '.');
+        }
+        org.bukkit.NamespacedKey key = org.bukkit.NamespacedKey.fromString(keyText);
+        return key == null ? null : org.bukkit.Registry.SOUNDS.get(key);
     }
 
     private void playSenderSound(CommandSender sender, String key) {
@@ -3326,6 +3379,10 @@ public final class BindingService {
     }
 
     private boolean canCreateLostReplacement(BindingRecord record) {
+        if (isPortableItemContainer(record.getItem())) {
+            plugin.getLogger().warning("已拒绝为旧版便携收纳物生成丢失补发，避免复制风险：绑定编号 " + shortId(record.getId()) + "。 ");
+            return false;
+        }
         if (coreProtectHook != null && coreProtectHook.isAvailable()) {
             if (!coreProtectHook.hasFreshLookup(record)
                     || coreProtectHook.isLookupPending(record)
@@ -3345,6 +3402,13 @@ public final class BindingService {
         plugin.getLogger().warning("已拒绝生成丢失召回以避免复制风险：绑定编号 " + shortId(record.getId())
                 + "，最后记录位置：" + location.describe() + "。");
         return false;
+    }
+
+    private String lostReplacementDeniedMessage(BindingRecord record) {
+        if (isPortableItemContainer(record.getItem())) {
+            return "该记录属于旧版可收纳物，已禁止生成丢失补发以避免复制；找到真实原物后仍可安全召回。 ";
+        }
+        return "暂不能丢失召回：无法确认原物品已消失。请先刷新位置或检查容器。 ";
     }
 
     private boolean isHeldByOtherPlayer(FoundItem found, UUID ownerUuid) {

@@ -1,5 +1,7 @@
 package awa.uxu;
 
+import com.destroystokyo.paper.event.player.PlayerArmorChangeEvent;
+
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.Material;
@@ -9,10 +11,13 @@ import org.bukkit.entity.Item;
 import org.bukkit.entity.ItemDisplay;
 import org.bukkit.entity.ItemFrame;
 import org.bukkit.entity.Player;
+import org.bukkit.event.Cancellable;
+import org.bukkit.event.Event;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.BlockBreakEvent;
+import org.bukkit.event.block.BlockDispenseArmorEvent;
 import org.bukkit.event.block.BlockDispenseEvent;
 import org.bukkit.event.block.BlockExplodeEvent;
 import org.bukkit.event.block.BlockPlaceEvent;
@@ -20,6 +25,7 @@ import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.EntityExplodeEvent;
 import org.bukkit.event.entity.EntityPickupItemEvent;
+import org.bukkit.event.entity.EntityShootBowEvent;
 import org.bukkit.event.entity.ItemDespawnEvent;
 import org.bukkit.event.entity.ItemMergeEvent;
 import org.bukkit.event.entity.ItemSpawnEvent;
@@ -54,7 +60,6 @@ import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.InventoryHolder;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.PlayerInventory;
-import org.bukkit.inventory.meta.Damageable;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -75,6 +80,14 @@ public final class BinderListener implements Listener {
     private static final Material CRAFTER_MATERIAL = Material.matchMaterial("CRAFTER");
     private final Map<UUID, PendingInventoryUpdate> pendingInventoryUpdates = new HashMap<>();
     private final Set<String> pendingBlockInventoryUpdates = new HashSet<>();
+    private final Map<UUID, Long> exhaustedUseWarnings = new HashMap<>();
+    private static final long EXHAUSTED_WARNING_COOLDOWN_MILLIS = 1000L;
+    private static final EquipmentSlot[] PLAYER_ARMOR_SLOTS = {
+            EquipmentSlot.HEAD,
+            EquipmentSlot.CHEST,
+            EquipmentSlot.LEGS,
+            EquipmentSlot.FEET
+    };
 
     public BinderListener(BinderPlugin plugin, BindingService service, BinderGui gui) {
         this.plugin = plugin;
@@ -367,6 +380,13 @@ public final class BinderListener implements Listener {
     }
 
     @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onBlockDispenseArmor(BlockDispenseArmorEvent event) {
+        if (service.isBoundItem(event.getItem()) && service.isExhaustedDurable(event.getItem())) {
+            event.setCancelled(true);
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
     public void onFurnaceBurn(FurnaceBurnEvent event) {
         if (service.containsLockedDeep(event.getFuel())) {
             event.setCancelled(true);
@@ -484,6 +504,11 @@ public final class BinderListener implements Listener {
         if (!service.isBoundItem(item)) {
             return;
         }
+        if (service.isExhaustedDurable(item)) {
+            event.setUseItemInHand(Event.Result.DENY);
+            warnExhaustedUse(event.getPlayer());
+            return;
+        }
         if (service.isUnsafeUse(item.getType())) {
             service.alertOperatedByOther(event.getPlayer(), "尝试使用", item);
             event.setCancelled(true);
@@ -494,8 +519,13 @@ public final class BinderListener implements Listener {
     @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
     public void onInteractEntity(PlayerInteractEntityEvent event) {
         ItemStack item = event.getPlayer().getInventory().getItem(event.getHand());
+        if (service.isBoundItem(item) && service.isExhaustedDurable(item)) {
+            cancelExhaustedUse(event.getPlayer(), event);
+            return;
+        }
         if (!(event.getRightClicked() instanceof ItemFrame itemFrame)) {
             if (service.isBoundItem(item)
+                    && item.getType().getMaxDurability() <= 0
                     && !(event.getRightClicked() instanceof ArmorStand)
                     && !(event.getRightClicked() instanceof InventoryHolder)) {
                 service.alertOperatedByOther(event.getPlayer(), "尝试用于实体", item);
@@ -626,20 +656,63 @@ public final class BinderListener implements Listener {
         if (!service.isBoundItem(item)) {
             return;
         }
-        if (item.getItemMeta() instanceof Damageable damageable) {
-            int max = item.getType().getMaxDurability();
-            if (max > 0 && damageable.getDamage() + event.getDamage() >= max) {
+        int remaining = service.remainingDurability(item);
+        if (remaining >= 0) {
+            int allowedDamage = remaining - 1;
+            if (allowedDamage <= 0) {
                 event.setCancelled(true);
-                event.getPlayer().sendMessage(service.prefix() + ChatColor.RED + "绑定物耐久不足，已阻止其损坏消失。 ");
+                schedulePlayerStateRefresh(event.getPlayer());
+                warnExhaustedUse(event.getPlayer());
                 return;
             }
+            if (event.getDamage() >= allowedDamage) {
+                event.setDamage(allowedDamage);
+                event.getPlayer().sendMessage(service.prefix() + ChatColor.YELLOW + "绑定物已降至 1 点耐久，修复前无法继续使用。 ");
+            }
         }
-        Bukkit.getScheduler().runTask(plugin, () -> service.updatePlayerLocations(event.getPlayer()));
+        schedulePlayerStateRefresh(event.getPlayer());
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onExhaustedToolBreak(BlockBreakEvent event) {
+        ItemStack item = event.getPlayer().getInventory().getItemInMainHand();
+        if (service.isBoundItem(item) && service.isExhaustedDurable(item)) {
+            cancelExhaustedUse(event.getPlayer(), event);
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onExhaustedWeaponDamage(EntityDamageByEntityEvent event) {
+        if (!(event.getDamager() instanceof Player player)) {
+            return;
+        }
+        ItemStack item = player.getInventory().getItemInMainHand();
+        if (service.isBoundItem(item) && service.isExhaustedDurable(item)) {
+            cancelExhaustedUse(player, event);
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onExhaustedBowUse(EntityShootBowEvent event) {
+        if (!(event.getEntity() instanceof Player player)) {
+            return;
+        }
+        ItemStack bow = event.getBow();
+        if (service.isBoundItem(bow) && service.isExhaustedDurable(bow)) {
+            cancelExhaustedUse(player, event);
+        }
     }
 
     @EventHandler(ignoreCancelled = true)
     public void onMend(PlayerItemMendEvent event) {
         Bukkit.getScheduler().runTask(plugin, () -> service.updatePlayerLocations(event.getPlayer()));
+    }
+
+    @EventHandler(ignoreCancelled = true)
+    public void onArmorChange(PlayerArmorChangeEvent event) {
+        if (service.isBoundItem(event.getNewItem()) && service.isExhaustedDurable(event.getNewItem())) {
+            schedulePlayerStateRefresh(event.getPlayer());
+        }
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
@@ -663,11 +736,15 @@ public final class BinderListener implements Listener {
 
     @EventHandler(ignoreCancelled = true)
     public void onJoin(PlayerJoinEvent event) {
-        Bukkit.getScheduler().runTaskLater(plugin, () -> service.updatePlayerLocations(event.getPlayer()), 20L);
+        Bukkit.getScheduler().runTaskLater(plugin, () -> {
+            disableExhaustedArmor(event.getPlayer());
+            service.updatePlayerLocations(event.getPlayer());
+        }, 20L);
     }
 
     @EventHandler(ignoreCancelled = true)
     public void onQuit(PlayerQuitEvent event) {
+        exhaustedUseWarnings.remove(event.getPlayer().getUniqueId());
         service.updatePlayerLocations(event.getPlayer());
     }
 
@@ -767,6 +844,7 @@ public final class BinderListener implements Listener {
             if (pendingUpdate == null) {
                 return;
             }
+            disableExhaustedArmor(player);
             service.updateInventoryInteractionLocations(
                     player,
                     pendingUpdate.top,
@@ -801,6 +879,81 @@ public final class BinderListener implements Listener {
             }
         }
         return false;
+    }
+
+    private void cancelExhaustedUse(Player player, Cancellable event) {
+        event.setCancelled(true);
+        warnExhaustedUse(player);
+    }
+
+    private void warnExhaustedUse(Player player) {
+        long now = System.currentTimeMillis();
+        long nextWarning = exhaustedUseWarnings.getOrDefault(player.getUniqueId(), 0L);
+        if (nextWarning > now) {
+            return;
+        }
+        exhaustedUseWarnings.put(player.getUniqueId(), now + EXHAUSTED_WARNING_COOLDOWN_MILLIS);
+        player.sendMessage(service.prefix() + ChatColor.RED + "该绑定物仅剩 1 点耐久，修复前无法使用。 ");
+        service.playSound(player, "error");
+    }
+
+    private void schedulePlayerStateRefresh(Player player) {
+        Bukkit.getScheduler().runTask(plugin, () -> {
+            disableExhaustedArmor(player);
+            service.updatePlayerLocations(player);
+        });
+    }
+
+    private void disableExhaustedArmor(Player player) {
+        PlayerInventory inventory = player.getInventory();
+        boolean removed = false;
+        boolean dropped = false;
+        for (EquipmentSlot slot : PLAYER_ARMOR_SLOTS) {
+            ArmorMoveResult result = moveExhaustedArmorToStorage(player, slot);
+            removed |= result.removed();
+            dropped |= result.dropped();
+        }
+        if (removed) {
+            player.updateInventory();
+            String destination = dropped ? "；背包已满的部分已安全掉落在脚下" : "";
+            player.sendMessage(service.prefix() + ChatColor.YELLOW + "仅剩 1 点耐久的绑定盔甲已自动卸下" + destination + "，修复后可重新装备。 ");
+        }
+    }
+
+    private ArmorMoveResult moveExhaustedArmorToStorage(Player player, EquipmentSlot slot) {
+        PlayerInventory inventory = player.getInventory();
+        ItemStack item = inventory.getItem(slot);
+        if (!service.isBoundItem(item) || !service.isExhaustedDurable(item)) {
+            return ArmorMoveResult.NONE;
+        }
+        int destination = inventory.firstEmpty();
+        boolean dropped = false;
+        if (destination < 0) {
+            destination = findDisplaceablePlayerSlot(inventory);
+            if (destination < 0) {
+                inventory.setItem(slot, null);
+                org.bukkit.entity.Item droppedItem = player.getWorld().dropItemNaturally(player.getLocation(), item);
+                service.updateDroppedItem(droppedItem);
+                return new ArmorMoveResult(true, true);
+            }
+            ItemStack displacedItem = inventory.getItem(destination);
+            inventory.setItem(destination, null);
+            player.getWorld().dropItemNaturally(player.getLocation(), displacedItem);
+            dropped = true;
+        }
+        inventory.setItem(slot, null);
+        inventory.setItem(destination, item);
+        return new ArmorMoveResult(true, dropped);
+    }
+
+    private int findDisplaceablePlayerSlot(PlayerInventory inventory) {
+        for (int slot = 0; slot < 36; slot++) {
+            ItemStack candidate = inventory.getItem(slot);
+            if (!service.isEmpty(candidate) && !service.containsBoundDeep(candidate)) {
+                return slot;
+            }
+        }
+        return -1;
     }
 
     private boolean isCrafter(Block block) {
@@ -843,5 +996,9 @@ public final class BinderListener implements Listener {
     }
 
     private record PendingBoundItem(ItemStack item, Set<UUID> ids) {
+    }
+
+    private record ArmorMoveResult(boolean removed, boolean dropped) {
+        private static final ArmorMoveResult NONE = new ArmorMoveResult(false, false);
     }
 }
